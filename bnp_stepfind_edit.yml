@@ -1,0 +1,111 @@
+name: stepfind
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - blas
+  - bottleneck
+  - brotli
+  - brotli-bin
+  - brotli-python
+  - bzip2
+  - ca-certificates
+  - certifi
+  - charset-normalizer
+  - contourpy
+  - cycler
+  - cyrus-sasl
+  - dbus
+  - expat
+  - fontconfig
+  - fonttools
+  - freetype
+  - glib
+  - glib-tools
+  - gst-plugins-base
+  - gstreamer
+  - icu
+  - idna
+  - jpeg
+  - kiwisolver
+  - krb5
+  - lcms2
+  - ld_impl_linux-64
+  - lerc
+  - libblas
+  - libbrotlicommon
+  - libbrotlidec
+  - libbrotlienc
+  - libcblas
+  - libclang
+  - libclang13
+  - libdeflate
+  - libedit
+  - libffi
+  - libgfortran
+  - libgfortran5
+  - libglib
+  - libiconv
+  - liblapack
+  - libllvm14
+  - libopenblas
+  - libpng
+  - libpq
+  - libtiff
+  - libuuid
+  - libwebp-base
+  - libxcb
+  - libxcrypt
+  - libxml2
+  - llvmlite=0.40.1  # Retained for compatibility with numba
+  - lz4-c
+  - matplotlib
+  - matplotlib-base
+  - mysql
+  - ncurses
+  - numba=0.57.1  # Retained for compatibility
+  - numexpr
+  - numpy=1.24.3  # Retained for compatibility
+  - numpy-base=1.24.3  # Retained for compatibility
+  - openjpeg
+  - openssl
+  - packaging
+  - pandas=1.5.3  # Retained for compatibility
+  - pcre2
+  - pexpect
+  - pickleshare
+  - pillow
+  - pip
+  - platformdirs
+  - ply
+  - pooch
+  - ptyprocess
+  - pyparsing
+  - pyqt
+  - pyqt5-sip
+  - pysocks
+  - python=3.10.11  # Retained for compatibility
+  - python-dateutil
+  - python_abi=3.10  # Retained for compatibility
+  - pytz
+  - qt-main
+  - readline
+  - requests
+  - scipy=1.10.1  # Retained for compatibility
+  - setuptools
+  - sip
+  - six
+  - sqlite
+  - tbb
+  - tk
+  - tomli
+  - tornado
+  - typing-extensions
+  - typing_extensions
+  - tzdata
+  - unicodedata2
+  - urllib3
+  - wheel
+  - xz
+  - zlib
+  - zstd
