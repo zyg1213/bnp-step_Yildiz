@@ -361,9 +361,8 @@ class BNPStep:
         #         self.ETA = np.concatenate((self.ETA, np.asarray([new_eta])), axis=0)
 
 
-
-
-
+        # Set the data accummulation array
+        self.Wacc = numpy.cumsum(data["data"])
 
         # Main sampler
         for samp in range(num_samples):
