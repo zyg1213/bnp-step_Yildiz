@@ -256,6 +256,39 @@ def sample_t(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec,
 
     return times_matrix[0]
 
+def sample_t_softmax(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec,
+             t_m_vec, f_vec, eta_vec, rng, temp):
+    """
+    Samples all t_m as part of BNP-Step's Gibbs sampler.
+
+    Arguments:
+    weak_limit -- Maximum number of possible steps
+    num_data -- Number of observations
+    data_points -- Observations
+    data_times -- Time points corresponding to each observation
+    b_m_vec -- Previous b_m samples
+    h_m_vec -- Previous h_m samples
+    t_m_vec -- Previous t_m samples
+    f_vec -- Previous F_bg samples
+    eta_vec -- Previous eta samples
+    rng -- Random number generator from BNPStep object
+    temp -- Temperature (for simulated annealing)
+
+    Returns:
+    times_matrix -- a numpy array containing each new t_m sample for 1:M (where M is weak_limit)
+                    Note: as vectorization results in a matrix of M identical copies of the samples, we 
+                          only need to return the first row of this matrix.
+    """
+    # Iterate through each t_m and generate new samples
+    for i in range(weak_limit):
+        # If the corresponding load is off, just sample from the prior
+        if b_m_vec[-1][sampling_order[i]] == 0:
+            times_matrix[:, sampling_order[i]] = rng.choice(data_times)
+        # Otherwise, perform a Metropolis update
+
+    return times_matrix[0]
+
+
 
 def sample_eta(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec, t_m_vec, f_vec,
                phi, eta_ref, rng, temp):
