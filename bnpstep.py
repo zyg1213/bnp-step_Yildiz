@@ -272,10 +272,12 @@ class BNPStep:
         
         # Get timepoints if we have them, otherwise pass a generic arange numpy array based on how many observations
         # we have
+        '''
         if data["times"] is not None:
             t_n = data["times"]
         else:
-            t_n = np.arange(len(data["data"]))
+        '''
+        t_n = np.arange(len(data["data"]))
 
         # Initialize sample arrays
         self.ETA = []
@@ -400,6 +402,10 @@ class BNPStep:
                                                     self.T_M, self.F_S, self.ETA, self.chi, self.h_ref, self.gamma,
                                                     self.phi, self.eta_ref, self.psi, self.F_ref)
             self.post = np.concatenate((self.post, np.asarray([poster])), axis=0)
+        
+        # Restoring the actual time:
+        if data["times"] is not None:
+            t_n = data["times"]  
         
         # Clean up posteriors - make all NaN's negative infinity, which will allow sorting by posterior
         for x in range(len(self.post)):
