@@ -24,8 +24,6 @@ from matplotlib.lines import Line2D
 from matplotlib.legend_handler import HandlerPatch
 from matplotlib.gridspec import GridSpec
 
-
-
 class BNPStep:
     def __init__(self, 
                  chi: float = 0.00028, 
@@ -137,6 +135,7 @@ class BNPStep:
         self.H_M = None
         self.T_M = None
         self.post = None
+        self.Wacc = None
 
         # Attributes to store results from alternative methods - these should not be used 
         # unless comparing to one of the other methods mentioned in the paper (iHMM or KV)
@@ -362,7 +361,8 @@ class BNPStep:
 
 
         # Set the data accummulation array
-        self.Wacc = numpy.cumsum(data["data"])
+        
+        self.Wacc = np.cumsum(data["data"])
 
         # Main sampler
         for samp in range(num_samples):
