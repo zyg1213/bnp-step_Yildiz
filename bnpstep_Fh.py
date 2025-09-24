@@ -7,12 +7,14 @@ Alex Rojewski, 2023
 
 """
 import os
+import importlib
 from typing import Optional, Dict, Union, List
 from pathlib import Path
 import warnings
 import numpy as np
 import bnpinputs as bnpi
 import bnpsampler as sampler
+importlib.reload(sampler)
 import bnpanalysis as bnpa
 import bic_tools as bic
 import pickle
@@ -375,9 +377,15 @@ class BNPStep:
             for i in np.random.permutation(range(4)):
                 if (i == 0):
                     # Sample F and h_m
+                    '''
                     Fh_tmp = sampler.sample_fh(self.B_max, len(data["data"]), data["data"], t_n, self.B_M, self.T_M, 
                                                 self.ETA, self.psi, self.chi, self.F_ref, self.h_ref, self.rng, 
                                                 temperature)
+                    '''
+                    Fh_tmp = sampler.sample_fh_fast(self.B_max, len(data["data"]), data["data"], t_n, self.B_M, self.T_M, 
+                                                self.ETA, self.psi, self.chi, self.F_ref, self.h_ref, self.rng, 
+                                                temperature, Wacc=self.Wacc)
+                    
                     h_new = Fh_tmp[1:]
                     self.F_S = np.concatenate((self.F_S, np.asarray([Fh_tmp[0]])), axis=0)
                     self.H_M = np.vstack((self.H_M, h_new))
@@ -388,14 +396,8 @@ class BNPStep:
                     self.B_M = np.vstack((self.B_M, b_new))
                 elif (i == 2):
                     # Sample t_m 
-                    '''
                     t_new = sampler.sample_t(self.B_max, len(data["data"]), data["data"], t_n, self.B_M, self.H_M, 
                                                 self.T_M, self.F_S, self.ETA, self.rng, temperature)
-                    '''
-                    # Sample t with Softmax
-                    t_new = sampler.sample_t_softmax(self.B_max, len(data["data"]), data["data"], t_n, self.B_M, self.H_M, 
-                                                self.T_M, self.F_S, self.ETA, self.rng, temperature, Wacc = self.Wacc)
-                    
                     self.T_M = np.vstack((self.T_M, t_new))
                 elif (i == 3):
                     # Sample eta

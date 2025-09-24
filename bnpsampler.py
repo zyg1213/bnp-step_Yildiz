@@ -178,6 +178,101 @@ def sample_fh(weak_limit, num_data, data_points, data_times, b_m_vec, t_m_vec, e
     return new_fh
 
 
+def sample_fh_fast(weak_limit, num_data, data_points, data_times,
+                   b_m_vec, t_m_vec, eta_vec, psi, chi, f_ref, h_ref, rng, temp,
+                   Wacc=None):
+    """
+    Accelerated version of sample_fh using closed-form precision matrix
+    from S19.pdf.
+
+    Arguments:
+    weak_limit -- maximum number of candidate steps (M)
+    num_data -- number of observations (N)
+    data_points -- observed data (w_1..N)
+    data_times -- observation times (t_1..N), must be monotonic increasing
+    b_m_vec -- previous b_m samples (take last row)
+    t_m_vec -- previous t_m samples (take last row, real times)
+    eta_vec -- previous eta samples (take last element)
+    psi, chi -- precision hyperparameters for Fbg, h_m priors
+    f_ref, h_ref -- prior means for Fbg, h_m
+    rng -- numpy Generator
+    temp -- annealing temperature
+    Wacc -- optional precomputed prefix sum of data_points
+    """
+    b = np.asarray(b_m_vec[-1], dtype=np.int8)
+    tau_real = np.asarray(t_m_vec[-1], dtype=np.float64)
+    eta = float(eta_vec[-1])
+
+    if Wacc is None:
+        Wacc = np.cumsum(np.asarray(data_points, dtype=np.float64))
+    else:
+        Wacc = np.asarray(Wacc, dtype=np.float64)
+
+    # indices of active steps (b=1), sorted by tau
+    on_idx = np.where(b == 1)[0]
+    if on_idx.size == 0:
+        # no active steps: F ~ N(f_ref, psi^-1), h_m ~ N(h_ref, chi^-1)
+        new_fh = np.empty(weak_limit + 1)
+        new_fh[0] = rng.normal(f_ref, np.sqrt(1.0/psi))
+        for m in range(weak_limit):
+            new_fh[m+1] = rng.normal(h_ref, np.sqrt(1.0/chi))
+        return new_fh
+
+    tau_idx = np.searchsorted(data_times, tau_real[on_idx], side="left")
+    order = np.argsort(tau_idx, kind="stable")
+    on_idx = on_idx[order]
+    tau_idx = tau_idx[order]
+    ml = on_idx.size
+
+    # build precision matrix Λ and q vector
+    dim = ml + 1
+    Lambda = np.zeros((dim, dim))
+    q = np.zeros(dim)
+
+    # (7) Λ11
+    Lambda[0, 0] = eta * num_data + psi
+    # (11) q1
+    q[0] = eta * Wacc[-1] + psi * f_ref
+
+    # fill rows/cols for active steps
+    for j in range(ml):
+        m = on_idx[j]
+        tau = tau_idx[j]
+        # (8) Λi1
+        Lambda[j+1, 0] = eta * tau
+        Lambda[0, j+1] = eta * tau
+        # (9) Λii
+        Lambda[j+1, j+1] = eta * tau + chi
+        # (12) qi
+        q[j+1] = eta * Wacc[tau] + chi * h_ref
+        # (10) Λij for i != j
+        for k in range(j):
+            tau_k = tau_idx[k]
+            val = eta * min(tau, tau_k)
+            Lambda[j+1, k+1] = val
+            Lambda[k+1, j+1] = val
+
+    # covariance and mean
+    cov = temp * np.linalg.inv(Lambda)
+    mean = cov @ q
+
+    # joint Gaussian sample
+    fh_sample = rng.multivariate_normal(mean, cov)
+
+    # build full vector of length weak_limit+1
+    new_fh = np.empty(weak_limit + 1)
+    new_fh[0] = fh_sample[0]  # Fbg
+    # assign active steps in order
+    for j, m in enumerate(on_idx):
+        new_fh[m+1] = fh_sample[j+1]
+    # inactive steps: sample from prior
+    off_idx = np.where(b == 0)[0]
+    for m in off_idx:
+        new_fh[m+1] = rng.normal(h_ref, np.sqrt(1.0/chi))
+
+    return new_fh
+
+
 def sample_t(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec,
              t_m_vec, f_vec, eta_vec, rng, temp):
     """
@@ -267,79 +362,79 @@ def sample_t_softmax(weak_limit, num_data, data_points, data_times,
              b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec, rng, temp,
              Wacc=None):
     """
-    Sample all t_m using the simplified exact conditional softmax method.
-    - Avoids constructing N×M matrices
-    - For each active step m, compute S_m(1..N) and sample once
+    Sample all t_m using the simplified exact conditional softmax method
+    with real-time H1/H2 updates.
 
-    Additional parameter:
-      Wacc: optional, prefix-sum array of data_points (if None, will be computed with np.cumsum)
+    Key points:
+      - Only compute softmax for steps with b_m = 1 (active); for b_m = 0 sample from prior
+      - After each tau_m update, recompute H1/H2 based on the latest tau values
     """
-    # --- Take the most recent samples ---
+    # 1) Get the most recent samples for b, h, t, F, eta
     b   = np.asarray(b_m_vec[-1], dtype=np.int8)        # (M,)
     h   = np.asarray(h_m_vec[-1], dtype=np.float64)     # (M,)
     t   = np.asarray(t_m_vec[-1], dtype=np.float64)     # (M,) real times
     F   = float(f_vec[-1])
     eta = float(eta_vec[-1])
 
-    # --- Precompute prefix sums and index vector ---
+    # 2) Prepare prefix sums Wacc (∑_{i≤n} w_i) and index vector n1 = 1..N
     if Wacc is None:
         Wacc = np.cumsum(np.asarray(data_points, dtype=np.float64))
     else:
         Wacc = np.asarray(Wacc, dtype=np.float64)
-    n1 = np.arange(1, num_data + 1, dtype=np.float64)   # 1..N
+    n1 = np.arange(1, num_data + 1, dtype=np.float64)
 
-    # --- Map real times to indices 0..N-1 (assume data_times is sorted ascending) ---
-    tau_idx_cur = np.searchsorted(data_times, t, side="left")  # (M,)
-
-    # --- Find active steps and sort them by tau index (needed for H1/H2) ---
+    # 3) Separate active and inactive step indices; t_new is updated in place
     on_mask = (b == 1)
     on_idx  = np.where(on_mask)[0]
+    off_idx = np.where(~on_mask)[0]
     t_new   = t.copy()
 
-    if on_idx.size == 0:
-        # No active steps: sample all from prior (uniform over data_times)
-        for m in range(weak_limit):
-            t_new[m] = rng.choice(data_times)
-        return t_new
-
-    h_on        = h[on_idx].astype(np.float64)                 # (B,)
-    tau_idx_on  = tau_idx_cur[on_idx].astype(np.int64)         # (B,)
-    order       = np.argsort(tau_idx_on, kind="stable")
-    on_idx_sorted = on_idx[order]
-    h_on        = h_on[order]
-    tau_idx_on  = tau_idx_on[order]
-    B = h_on.size
-
-    # --- Construct exclusive prefix/suffix terms (Eq.7-9) ---
-    # H1_excl[m] = sum_{j < m} h_j * tau_idx_j
-    # H2_excl[m] = sum_{j > m} h_j
-    h_tau    = h_on * tau_idx_on.astype(np.float64)
-    H1_excl  = np.concatenate(([0.0], np.cumsum(h_tau)[:-1]))                 # (B,)
-    H2_excl  = np.concatenate((np.cumsum(h_on[::-1])[:-1][::-1], [0.0]))      # (B,)
-
-    # --- Annealing factor (temperature scales the energy) ---
-    scale = -eta / (2.0 * float(temp))
-
-    # --- For each active step, compute logits(n) = scale*(a*Wacc[n] + b*n1 + c) and sample ---
-    for local_m, m in enumerate(on_idx_sorted):
-        hm = h[m]
-        a = -2.0 * hm
-        bcoef = 2.0 * F * hm + hm * hm + 2.0 * hm * H2_excl[local_m]
-        c = 2.0 * hm * H1_excl[local_m]
-
-        logits = scale * (a * Wacc + bcoef * n1 + c)   # length N
-        n_star = _softmax_sample_logits(logits, rng)   # sample index 0..N-1
-
-        t_new[m] = data_times[n_star]                  # write back real time
-
-    # --- For inactive steps, sample from prior uniformly ---
-    off_idx = np.where(~on_mask)[0]
+    # 4) For inactive steps (b_m=0), sample from prior (uniform over data_times)
     for m in off_idx:
         t_new[m] = rng.choice(data_times)
 
+    # 5) If no active steps, return immediately
+    if on_idx.size == 0:
+        return t_new
+
+    # 6) Annealing scale factor (temperature scales the energy)
+    scale = -eta / (2.0 * float(temp))
+
+    # 7) Update active steps in random order (random-scan Gibbs)
+    order_scan = np.array(on_idx, copy=True)
+    rng.shuffle(order_scan)
+
+    for m in order_scan:
+        hm = h[m]
+
+        # 7.1) Compute current tau indices of all active steps based on latest t_new,
+        #      then sort them by (tau, original index) for stable ordering
+        tau_idx_all = np.searchsorted(data_times, t_new[on_idx], side="left")  # (B,)
+        order = np.lexsort((on_idx, tau_idx_all))  # break ties by original index
+        idx_ord   = on_idx[order]
+        tau_ord   = tau_idx_all[order].astype(np.float64)
+        h_ord     = h[idx_ord]
+
+        # 7.2) Locate the position of current step m in the ordered list
+        pos = int(np.where(idx_ord == m)[0][0])
+
+        # 7.3) Real-time calculation of prefix/suffix:
+        # H1_m = sum_{j < pos} h_j * tau_j ; H2_m = sum_{j > pos} h_j
+        H1_m = float(np.dot(h_ord[:pos], tau_ord[:pos])) if pos > 0 else 0.0
+        H2_m = float(np.sum(h_ord[pos+1:])) if pos+1 < h_ord.size else 0.0
+
+        # 7.4) Build logits(n) = scale * [a*Wacc[n] + b*n1 + c], then sample with softmax
+        a = -2.0 * hm
+        bcoef = 2.0 * F * hm + hm * hm + 2.0 * hm * H2_m
+        c = 2.0 * hm * H1_m
+
+        logits = scale * (a * Wacc + bcoef * n1 + c)   # length N
+        n_star = _softmax_sample_logits(logits, rng)   # index 0..N-1
+
+        # 7.5) Write back the new real time tau_m (in-place update for consistency)
+        t_new[m] = data_times[n_star]
+
     return t_new
-
-
 
 
 def sample_eta(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec, t_m_vec, f_vec,
