@@ -387,8 +387,13 @@ class BNPStep:
                                                 self.T_M, self.F_S, self.ETA, self.gamma, self.rng, temperature)
                     self.B_M = np.vstack((self.B_M, b_new))
                 elif (i == 2):
-                    # Sample t_m
+                    # Sample t_m 
+                    '''
                     t_new = sampler.sample_t(self.B_max, len(data["data"]), data["data"], t_n, self.B_M, self.H_M, 
+                                                self.T_M, self.F_S, self.ETA, self.rng, temperature)
+                    '''
+                    # Sample t with Softmax
+                    t_new = sampler.sample_t_softmax(self.B_max, len(data["data"]), data["data"], t_n, self.B_M, self.H_M, 
                                                 self.T_M, self.F_S, self.ETA, self.rng, temperature)
                     self.T_M = np.vstack((self.T_M, t_new))
                 elif (i == 3):
