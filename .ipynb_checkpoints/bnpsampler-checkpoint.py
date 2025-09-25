@@ -80,7 +80,6 @@ def sample_b(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec, t_
 
     return load_matrix[0]
 
-
 def sample_fh(weak_limit, num_data, data_points, data_times, b_m_vec, t_m_vec, eta_vec, psi, chi, f_ref, h_ref, rng,
               temp):
     """
@@ -178,6 +177,118 @@ def sample_fh(weak_limit, num_data, data_points, data_times, b_m_vec, t_m_vec, e
     return new_fh
 
 
+def sample_fh_new(weak_limit, num_data, data_points, data_times,
+              b_m_vec, t_m_vec, eta_vec,
+              psi, chi, f_ref, h_ref, rng, temp,
+              Wacc=None):
+    """
+    Optimized sampler for (F_bg, h_1..h_M) using prefix sums and the min(tau_i, tau_j) structure.
+    - No N×B Heaviside matrices
+    - Complexity depends on the number of active steps B (typically ~ gamma), not on N
+    Assumes heaviside direction H(tau - t); data_times must be sorted ascending.
+    """
+
+    # --- Take current samples/values ---
+    b   = np.asarray(b_m_vec[-1], dtype=np.int8)         # (M,)
+    t   = np.asarray(t_m_vec[-1], dtype=np.float64)      # (M,) real times
+    eta = float(eta_vec[-1])
+    N   = int(num_data)
+
+    # --- Prefix sums of data (Wacc[n] = sum_{i<=n} w_i), if not provided ---
+    #     Wacc has length N and 0-based indices map to counts 1..N.
+    if Wacc is None:
+        Wacc = np.cumsum(np.asarray(data_points, dtype=np.float64))
+    else:
+        Wacc = np.asarray(Wacc, dtype=np.float64)
+
+    # --- Split active/inactive indices ---
+    on_idx  = np.where(b == 1)[0]
+    off_idx = np.where(b == 0)[0]
+    B = on_idx.size
+
+    # Container for the final (F,h) in original order: [F, h_0, h_1, ..., h_{M-1}]
+    fh_size = weak_limit + 1
+    new_fh = np.zeros(fh_size, dtype=np.float64)
+
+    # If no active steps: sample all h from prior; sample F from its 1D conditional
+    if B == 0:
+        # F | rest ~ N( mean = (eta*sum(w)+psi*f_ref)/(eta*N+psi), var = temp*(eta*N+psi)^{-1} )
+        prec_F = eta * N + psi
+        mean_F = (eta * float(np.sum(data_points)) + psi * float(f_ref)) / prec_F
+        std_F  = np.sqrt(temp / prec_F)
+        new_fh[0] = rng.normal(mean_F, std_F)
+
+        for i in range(weak_limit):
+            new_fh[i+1] = rng.normal(h_ref, np.sqrt(1.0/chi))
+        return new_fh
+
+    # --- Map real times to discrete indices 0..N-1, then to counts 1..N ---
+    #     (Assumes data_times is sorted; searchsorted maps tau to the nearest grid index on the left)
+    tau_idx = np.searchsorted(data_times, t[on_idx], side="left").astype(np.int64)      # 0..N-1
+    tau_cnt = tau_idx.astype(np.float64) + 1.0                                          # 1..N
+
+    # --- Sort active steps by tau for numerical stability (not strictly required here, but useful) ---
+    order = np.argsort(tau_idx, kind="stable")
+    on_ord   = on_idx[order]          # indices in original [0..M-1] space
+    tau_idx  = tau_idx[order]         # 0..N-1
+    tau_cnt  = tau_cnt[order]         # 1..N as floats
+
+    # --- Build the precision matrix Lambda (size (B+1) x (B+1)) without N×B matrices ---
+    # Top-left (F block):
+    L00 = eta * N + psi
+
+    # Top-right / bottom-left (coupling F with each active h): r_i = eta * tau_i
+    r = eta * tau_cnt  # shape (B,)
+
+    # Bottom-right (hh block): eta * K + chi * I, with K_ij = min(tau_i, tau_j)
+    # Build K by broadcasting min over tau_cnt (B×B). Cost O(B^2).
+    # For B ~ 10-50 this is trivial compared to old O(NB^2).
+    tau_row = tau_cnt.reshape(-1, 1)
+    K = np.minimum(tau_row, tau_row.T)                           # (B,B)
+    L_hh = eta * K + chi * np.eye(B, dtype=np.float64)           # (B,B)
+
+    # Assemble full precision Lambda
+    # [ [L00, r^T],
+    #   [ r , L_hh] ]
+    Lambda = np.empty((B+1, B+1), dtype=np.float64)
+    Lambda[0, 0] = L00
+    Lambda[0, 1:] = r
+    Lambda[1:, 0] = r
+    Lambda[1:, 1:] = L_hh
+
+    # --- Build RHS vector q (size B+1) using prefix sums (no N×B multiplies) ---
+    # q0 = eta * sum(data_points) + psi * f_ref
+    q0 = eta * float(np.sum(data_points)) + psi * float(f_ref)
+    # qh_i = eta * Wacc[tau_idx_i] + chi * h_ref
+    qh = eta * Wacc[tau_idx] + chi * float(h_ref)                # (B,)
+
+    q = np.empty((B+1, 1), dtype=np.float64)
+    q[0, 0] = q0
+    q[1:, 0] = qh
+
+    # --- Solve for mean and (optionally) covariance; sample jointly from N(mean, temp * Lambda^{-1}) ---
+    # You can avoid explicit inverse; however, for B~20 a direct inverse is already cheap.
+    # If you prefer, replace inv() with a Cholesky-based solve and sampling in precision domain.
+    # Mean:
+    mean = np.linalg.solve(Lambda, q)                            # (B+1,1)
+
+    # Covariance = temp * Lambda^{-1}
+    cov = temp * np.linalg.inv(Lambda)                           # (B+1,B+1)
+
+    # Joint sample (F and active h's)
+    fh_act = np.ravel(MultivariateGaussian.sample(mean, sigma=cov, epsilon=1e-8))  # length B+1
+
+    # --- Scatter back to full (F,h) vector in original order; sample inactive h from prior ---
+    new_fh[0] = fh_act[0]
+    # Active h's (fh_act[1:] corresponds to on_ord order)
+    for k, m in enumerate(on_ord):
+        new_fh[m+1] = fh_act[k+1]
+    # Inactive h's ~ N(h_ref, chi^{-1})
+    for m in off_idx:
+        new_fh[m+1] = rng.normal(h_ref, np.sqrt(1.0/chi))
+
+    return new_fh
+
 def sample_t(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec,
              t_m_vec, f_vec, eta_vec, rng, temp):
     """
@@ -256,91 +367,127 @@ def sample_t(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec,
 
     return times_matrix[0]
 
-def _softmax_sample_logits(logits, rng):
-    """Numerically stable softmax sampling: given logits, return one index sampled according to softmax probabilities."""
-    z = logits - logits.max()
+def _softmax_sample_from_logits(logits, rng):
+    """
+    Numerically stable softmax sampling:
+    - logits: 1D array of real-valued scores
+    - returns: one index sampled according to softmax(logits)
+    """
+    z = logits - np.max(logits)                  # log-sum-exp stabilization
     p = np.exp(z, dtype=np.float64)
-    p /= p.sum()
-    return rng.choice(p.size, p=p)
+    s = p.sum()
+    if not np.isfinite(s) or s <= 0.0:           # extreme underflow/NaN guard
+        # fall back to argmax, which matches the limit of an extremely peaked softmax
+        return int(np.argmax(logits))
+    p /= s
+    # sample via inverse-CDF to be robust when p is very sparse
+    u = rng.random()
+    cdf = np.cumsum(p)
+    return int(np.searchsorted(cdf, u, side="left"))
 
-def sample_t_softmax(weak_limit, num_data, data_points, data_times,
-             b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec, rng, temp,
-             Wacc=None):
+def sample_t_softmax_strict(weak_limit, num_data, data_points, data_times,
+                            b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec, rng, temp,
+                            Wacc=None, eps=1e-12):
     """
-    Sample all t_m using the simplified exact conditional softmax method.
-    - Avoids constructing N×M matrices
-    - For each active step m, compute S_m(1..N) and sample once
+    Strict softmax Gibbs update for all tau_m (sampling efficiency prioritized).
+      - Only compute softmax for active steps (b_m=1); inactive steps sample from prior
+      - After each tau_m update, recompute H1/H2 using the latest tau_{-m} (strict Gibbs)
+      - Numerically stable: log-sum-exp, clipping, tie-handling, temperature scaling
 
-    Additional parameter:
-      Wacc: optional, prefix-sum array of data_points (if None, will be computed with np.cumsum)
+    Args:
+      weak_limit: M (max number of steps)
+      num_data: N (number of observations)
+      data_points: array of length N (w_1..N)
+      data_times: array of length N (assumed non-decreasing)
+      b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec: sampler histories (use last entries)
+      rng: numpy.random.Generator
+      temp: temperature for simulated annealing (>=1 typically)
+      Wacc: optional prefix sums of data_points; if None, computed via cumsum
+      eps: small epsilon for numerical guards
+
+    Returns:
+      t_new: array (length M) with updated real-valued tau times
     """
-    # --- Take the most recent samples ---
+    # -- Current state (use last samples) --
     b   = np.asarray(b_m_vec[-1], dtype=np.int8)        # (M,)
     h   = np.asarray(h_m_vec[-1], dtype=np.float64)     # (M,)
     t   = np.asarray(t_m_vec[-1], dtype=np.float64)     # (M,) real times
     F   = float(f_vec[-1])
     eta = float(eta_vec[-1])
+    M   = int(weak_limit)
+    N   = int(num_data)
 
-    # --- Precompute prefix sums and index vector ---
+    # -- Precompute Wacc and index vector 1..N --
     if Wacc is None:
         Wacc = np.cumsum(np.asarray(data_points, dtype=np.float64))
     else:
         Wacc = np.asarray(Wacc, dtype=np.float64)
-    n1 = np.arange(1, num_data + 1, dtype=np.float64)   # 1..N
+    n1 = np.arange(1, N + 1, dtype=np.float64)
 
-    # --- Map real times to indices 0..N-1 (assume data_times is sorted ascending) ---
-    tau_idx_cur = np.searchsorted(data_times, t, side="left")  # (M,)
+    # Bounds for clipping (searchsorted safety)
+    tmin, tmax = float(data_times[0]), float(data_times[-1])
 
-    # --- Find active steps and sort them by tau index (needed for H1/H2) ---
+    # -- Partition active and inactive steps --
     on_mask = (b == 1)
     on_idx  = np.where(on_mask)[0]
-    t_new   = t.copy()
-
-    if on_idx.size == 0:
-        # No active steps: sample all from prior (uniform over data_times)
-        for m in range(weak_limit):
-            t_new[m] = rng.choice(data_times)
-        return t_new
-
-    h_on        = h[on_idx].astype(np.float64)                 # (B,)
-    tau_idx_on  = tau_idx_cur[on_idx].astype(np.int64)         # (B,)
-    order       = np.argsort(tau_idx_on, kind="stable")
-    on_idx_sorted = on_idx[order]
-    h_on        = h_on[order]
-    tau_idx_on  = tau_idx_on[order]
-    B = h_on.size
-
-    # --- Construct exclusive prefix/suffix terms (Eq.7-9) ---
-    # H1_excl[m] = sum_{j < m} h_j * tau_idx_j
-    # H2_excl[m] = sum_{j > m} h_j
-    h_tau    = h_on * tau_idx_on.astype(np.float64)
-    H1_excl  = np.concatenate(([0.0], np.cumsum(h_tau)[:-1]))                 # (B,)
-    H2_excl  = np.concatenate((np.cumsum(h_on[::-1])[:-1][::-1], [0.0]))      # (B,)
-
-    # --- Annealing factor (temperature scales the energy) ---
-    scale = -eta / (2.0 * float(temp))
-
-    # --- For each active step, compute logits(n) = scale*(a*Wacc[n] + b*n1 + c) and sample ---
-    for local_m, m in enumerate(on_idx_sorted):
-        hm = h[m]
-        a = -2.0 * hm
-        bcoef = 2.0 * F * hm + hm * hm + 2.0 * hm * H2_excl[local_m]
-        c = 2.0 * hm * H1_excl[local_m]
-
-        logits = scale * (a * Wacc + bcoef * n1 + c)   # length N
-        n_star = _softmax_sample_logits(logits, rng)   # sample index 0..N-1
-
-        t_new[m] = data_times[n_star]                  # write back real time
-
-    # --- For inactive steps, sample from prior uniformly ---
     off_idx = np.where(~on_mask)[0]
+
+    # Initialize result with old values
+    t_new = t.copy()
+
+    # Inactive steps: sample from prior (uniform over data_times) to match original behavior
     for m in off_idx:
         t_new[m] = rng.choice(data_times)
 
+    # If no active steps, we are done
+    if on_idx.size == 0:
+        return t_new
+
+    # -- Temperature scaling in energy --
+    scale = -eta / (2.0 * max(float(temp), eps))
+
+    # -- Random-scan Gibbs (better mixing) --
+    order_scan = np.array(on_idx, copy=True)
+    rng.shuffle(order_scan)
+
+    for m in order_scan:
+        hm = float(h[m])
+
+        # (1) Map latest tau to indices and build a stable order among active steps
+        tau_idx_all = np.searchsorted(
+            data_times,
+            np.clip(t_new[on_idx], tmin, tmax),
+            side="left"
+        )
+        tau_idx_all = np.clip(tau_idx_all, 0, N - 1)
+
+        # Stable sort by (tau_idx, original index)
+        order = np.lexsort((on_idx, tau_idx_all))
+        idx_ord = on_idx[order]
+        tau_ord = tau_idx_all[order].astype(np.float64)
+        h_ord   = h[idx_ord].astype(np.float64)
+
+        # Enforce non-decreasing and add tiny jitter if exact ties remain
+        tau_ord = np.maximum.accumulate(tau_ord)
+        if np.any(np.diff(tau_ord) <= 0):
+            tau_ord += eps * np.arange(tau_ord.size, dtype=np.float64)
+
+        # (2) Locate current step m and compute H1/H2 in real-time (O(B))
+        pos = int(np.where(idx_ord == m)[0][0])
+        H1 = float(np.dot(h_ord[:pos], tau_ord[:pos])) if pos > 0 else 0.0
+        H2 = float(np.sum(h_ord[pos+1:])) if pos + 1 < h_ord.size else 0.0
+
+        # (3) Build logits(n) = scale * [ a*Wacc[n] + b*n1 + c ]
+        a = -2.0 * hm
+        bcoef = 2.0 * F * hm + hm * hm + 2.0 * hm * H2
+        c = 2.0 * hm * H1
+        logits = scale * (a * Wacc + bcoef * n1 + c)  # length N
+
+        # (4) Sample index n* via softmax and write back the real time
+        n_star = _softmax_sample_from_logits(logits, rng)
+        t_new[m] = data_times[n_star]
+
     return t_new
-
-
-
 
 def sample_eta(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec, t_m_vec, f_vec,
                phi, eta_ref, rng, temp):

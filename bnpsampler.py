@@ -80,7 +80,6 @@ def sample_b(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec, t_
 
     return load_matrix[0]
 
-
 def sample_fh(weak_limit, num_data, data_points, data_times, b_m_vec, t_m_vec, eta_vec, psi, chi, f_ref, h_ref, rng,
               temp):
     """
@@ -178,100 +177,117 @@ def sample_fh(weak_limit, num_data, data_points, data_times, b_m_vec, t_m_vec, e
     return new_fh
 
 
-def sample_fh_fast(weak_limit, num_data, data_points, data_times,
-                   b_m_vec, t_m_vec, eta_vec, psi, chi, f_ref, h_ref, rng, temp,
-                   Wacc=None):
+def sample_fh_new(weak_limit, num_data, data_points, data_times,
+              b_m_vec, t_m_vec, eta_vec,
+              psi, chi, f_ref, h_ref, rng, temp,
+              Wacc=None):
     """
-    Accelerated version of sample_fh using closed-form precision matrix
-    from S19.pdf.
+    Optimized sampler for (F_bg, h_1..h_M) using prefix sums and the min(tau_i, tau_j) structure.
+    - No N×B Heaviside matrices
+    - Complexity depends on the number of active steps B (typically ~ gamma), not on N
+    Assumes heaviside direction H(tau - t); data_times must be sorted ascending.
+    """
 
-    Arguments:
-    weak_limit -- maximum number of candidate steps (M)
-    num_data -- number of observations (N)
-    data_points -- observed data (w_1..N)
-    data_times -- observation times (t_1..N), must be monotonic increasing
-    b_m_vec -- previous b_m samples (take last row)
-    t_m_vec -- previous t_m samples (take last row, real times)
-    eta_vec -- previous eta samples (take last element)
-    psi, chi -- precision hyperparameters for Fbg, h_m priors
-    f_ref, h_ref -- prior means for Fbg, h_m
-    rng -- numpy Generator
-    temp -- annealing temperature
-    Wacc -- optional precomputed prefix sum of data_points
-    """
-    b = np.asarray(b_m_vec[-1], dtype=np.int8)
-    tau_real = np.asarray(t_m_vec[-1], dtype=np.float64)
+    # --- Take current samples/values ---
+    b   = np.asarray(b_m_vec[-1], dtype=np.int8)         # (M,)
+    t   = np.asarray(t_m_vec[-1], dtype=np.float64)      # (M,) real times
     eta = float(eta_vec[-1])
+    N   = int(num_data)
 
+    # --- Prefix sums of data (Wacc[n] = sum_{i<=n} w_i), if not provided ---
+    #     Wacc has length N and 0-based indices map to counts 1..N.
     if Wacc is None:
         Wacc = np.cumsum(np.asarray(data_points, dtype=np.float64))
     else:
         Wacc = np.asarray(Wacc, dtype=np.float64)
 
-    # indices of active steps (b=1), sorted by tau
-    on_idx = np.where(b == 1)[0]
-    if on_idx.size == 0:
-        # no active steps: F ~ N(f_ref, psi^-1), h_m ~ N(h_ref, chi^-1)
-        new_fh = np.empty(weak_limit + 1)
-        new_fh[0] = rng.normal(f_ref, np.sqrt(1.0/psi))
-        for m in range(weak_limit):
-            new_fh[m+1] = rng.normal(h_ref, np.sqrt(1.0/chi))
+    # --- Split active/inactive indices ---
+    on_idx  = np.where(b == 1)[0]
+    off_idx = np.where(b == 0)[0]
+    B = on_idx.size
+
+    # Container for the final (F,h) in original order: [F, h_0, h_1, ..., h_{M-1}]
+    fh_size = weak_limit + 1
+    new_fh = np.zeros(fh_size, dtype=np.float64)
+
+    # If no active steps: sample all h from prior; sample F from its 1D conditional
+    if B == 0:
+        # F | rest ~ N( mean = (eta*sum(w)+psi*f_ref)/(eta*N+psi), var = temp*(eta*N+psi)^{-1} )
+        prec_F = eta * N + psi
+        mean_F = (eta * float(np.sum(data_points)) + psi * float(f_ref)) / prec_F
+        std_F  = np.sqrt(temp / prec_F)
+        new_fh[0] = rng.normal(mean_F, std_F)
+
+        for i in range(weak_limit):
+            new_fh[i+1] = rng.normal(h_ref, np.sqrt(1.0/chi))
         return new_fh
 
-    tau_idx = np.searchsorted(data_times, tau_real[on_idx], side="left")
+    # --- Map real times to discrete indices 0..N-1, then to counts 1..N ---
+    #     (Assumes data_times is sorted; searchsorted maps tau to the nearest grid index on the left)
+    tau_idx = np.searchsorted(data_times, t[on_idx], side="left").astype(np.int64)      # 0..N-1
+    tau_cnt = tau_idx.astype(np.float64) + 1.0                                          # 1..N
+
+    # --- Sort active steps by tau for numerical stability (not strictly required here, but useful) ---
     order = np.argsort(tau_idx, kind="stable")
-    on_idx = on_idx[order]
-    tau_idx = tau_idx[order]
-    ml = on_idx.size
+    on_ord   = on_idx[order]          # indices in original [0..M-1] space
+    tau_idx  = tau_idx[order]         # 0..N-1
+    tau_cnt  = tau_cnt[order]         # 1..N as floats
 
-    # build precision matrix Λ and q vector
-    dim = ml + 1
-    Lambda = np.zeros((dim, dim))
-    q = np.zeros(dim)
+    # --- Build the precision matrix Lambda (size (B+1) x (B+1)) without N×B matrices ---
+    # Top-left (F block):
+    L00 = eta * N + psi
 
-    # (7) Λ11
-    Lambda[0, 0] = eta * num_data + psi
-    # (11) q1
-    q[0] = eta * Wacc[-1] + psi * f_ref
+    # Top-right / bottom-left (coupling F with each active h): r_i = eta * tau_i
+    r = eta * tau_cnt  # shape (B,)
 
-    # fill rows/cols for active steps
-    for j in range(ml):
-        m = on_idx[j]
-        tau = tau_idx[j]
-        # (8) Λi1
-        Lambda[j+1, 0] = eta * tau
-        Lambda[0, j+1] = eta * tau
-        # (9) Λii
-        Lambda[j+1, j+1] = eta * tau + chi
-        # (12) qi
-        q[j+1] = eta * Wacc[tau] + chi * h_ref
-        # (10) Λij for i != j
-        for k in range(j):
-            tau_k = tau_idx[k]
-            val = eta * min(tau, tau_k)
-            Lambda[j+1, k+1] = val
-            Lambda[k+1, j+1] = val
+    # Bottom-right (hh block): eta * K + chi * I, with K_ij = min(tau_i, tau_j)
+    # Build K by broadcasting min over tau_cnt (B×B). Cost O(B^2).
+    # For B ~ 10-50 this is trivial compared to old O(NB^2).
+    tau_row = tau_cnt.reshape(-1, 1)
+    K = np.minimum(tau_row, tau_row.T)                           # (B,B)
+    L_hh = eta * K + chi * np.eye(B, dtype=np.float64)           # (B,B)
 
-    # covariance and mean
-    cov = temp * np.linalg.inv(Lambda)
-    mean = cov @ q
+    # Assemble full precision Lambda
+    # [ [L00, r^T],
+    #   [ r , L_hh] ]
+    Lambda = np.empty((B+1, B+1), dtype=np.float64)
+    Lambda[0, 0] = L00
+    Lambda[0, 1:] = r
+    Lambda[1:, 0] = r
+    Lambda[1:, 1:] = L_hh
 
-    # joint Gaussian sample
-    fh_sample = rng.multivariate_normal(mean, cov)
+    # --- Build RHS vector q (size B+1) using prefix sums (no N×B multiplies) ---
+    # q0 = eta * sum(data_points) + psi * f_ref
+    q0 = eta * float(np.sum(data_points)) + psi * float(f_ref)
+    # qh_i = eta * Wacc[tau_idx_i] + chi * h_ref
+    qh = eta * Wacc[tau_idx] + chi * float(h_ref)                # (B,)
 
-    # build full vector of length weak_limit+1
-    new_fh = np.empty(weak_limit + 1)
-    new_fh[0] = fh_sample[0]  # Fbg
-    # assign active steps in order
-    for j, m in enumerate(on_idx):
-        new_fh[m+1] = fh_sample[j+1]
-    # inactive steps: sample from prior
-    off_idx = np.where(b == 0)[0]
+    q = np.empty((B+1, 1), dtype=np.float64)
+    q[0, 0] = q0
+    q[1:, 0] = qh
+
+    # --- Solve for mean and (optionally) covariance; sample jointly from N(mean, temp * Lambda^{-1}) ---
+    # You can avoid explicit inverse; however, for B~20 a direct inverse is already cheap.
+    # If you prefer, replace inv() with a Cholesky-based solve and sampling in precision domain.
+    # Mean:
+    mean = np.linalg.solve(Lambda, q)                            # (B+1,1)
+
+    # Covariance = temp * Lambda^{-1}
+    cov = temp * np.linalg.inv(Lambda)                           # (B+1,B+1)
+
+    # Joint sample (F and active h's)
+    fh_act = np.ravel(MultivariateGaussian.sample(mean, sigma=cov, epsilon=1e-8))  # length B+1
+
+    # --- Scatter back to full (F,h) vector in original order; sample inactive h from prior ---
+    new_fh[0] = fh_act[0]
+    # Active h's (fh_act[1:] corresponds to on_ord order)
+    for k, m in enumerate(on_ord):
+        new_fh[m+1] = fh_act[k+1]
+    # Inactive h's ~ N(h_ref, chi^{-1})
     for m in off_idx:
         new_fh[m+1] = rng.normal(h_ref, np.sqrt(1.0/chi))
 
     return new_fh
-
 
 def sample_t(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec,
              t_m_vec, f_vec, eta_vec, rng, temp):
