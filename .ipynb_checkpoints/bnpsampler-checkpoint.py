@@ -424,9 +424,6 @@ def sample_t_softmax_strict(weak_limit, num_data, data_points, data_times,
         Wacc = np.asarray(Wacc, dtype=np.float64)
     n1 = np.arange(1, N + 1, dtype=np.float64)
 
-    # Bounds for clipping (searchsorted safety)
-    tmin, tmax = float(data_times[0]), float(data_times[-1])
-
     # -- Partition active and inactive steps --
     on_mask = (b == 1)
     on_idx  = np.where(on_mask)[0]
@@ -450,43 +447,46 @@ def sample_t_softmax_strict(weak_limit, num_data, data_points, data_times,
     order_scan = np.array(on_idx, copy=True)
     rng.shuffle(order_scan)
 
+    tmin, tmax = float(data_times[0]), float(data_times[-1])
+    
     for m in order_scan:
         hm = float(h[m])
 
-        # (1) Map latest tau to indices and build a stable order among active steps
+        # Map latest tau to indices and build a stable order among active steps
         tau_idx_all = np.searchsorted(
             data_times,
             np.clip(t_new[on_idx], tmin, tmax),
             side="left"
         )
         tau_idx_all = np.clip(tau_idx_all, 0, N - 1)
-
+    
         # Stable sort by (tau_idx, original index)
         order = np.lexsort((on_idx, tau_idx_all))
         idx_ord = on_idx[order]
         tau_ord = tau_idx_all[order].astype(np.float64)
         h_ord   = h[idx_ord].astype(np.float64)
 
+        #  Locate current step m and compute H1/H2 in real-time (O(B))
+        pos = int(np.where(idx_ord == m)[0][0])
+        H2 = float(np.sum(h_ord[pos+1:])) if pos + 1 < h_ord.size else 0.0
+
+        # Build logits(n) = scale * [ a*Wacc[n] + b*n1 + c ]
+        a = -2.0 * hm
+        bcoef = 2.0 * F * hm + hm * hm + 2.0 * hm * H2
+        logits = scale * (a * Wacc + bcoef * n1)  # length N
+
+        # Sample index n* via softmax and write back the real time
+        n_star = _softmax_sample_from_logits(logits, rng)
+        t_new[m] = data_times[n_star]
+   
+    '''
+    
+
         # Enforce non-decreasing and add tiny jitter if exact ties remain
         tau_ord = np.maximum.accumulate(tau_ord)
         if np.any(np.diff(tau_ord) <= 0):
             tau_ord += eps * np.arange(tau_ord.size, dtype=np.float64)
-
-        # (2) Locate current step m and compute H1/H2 in real-time (O(B))
-        pos = int(np.where(idx_ord == m)[0][0])
-        H1 = float(np.dot(h_ord[:pos], tau_ord[:pos])) if pos > 0 else 0.0
-        H2 = float(np.sum(h_ord[pos+1:])) if pos + 1 < h_ord.size else 0.0
-
-        # (3) Build logits(n) = scale * [ a*Wacc[n] + b*n1 + c ]
-        a = -2.0 * hm
-        bcoef = 2.0 * F * hm + hm * hm + 2.0 * hm * H2
-        c = 2.0 * hm * H1
-        logits = scale * (a * Wacc + bcoef * n1 + c)  # length N
-
-        # (4) Sample index n* via softmax and write back the real time
-        n_star = _softmax_sample_from_logits(logits, rng)
-        t_new[m] = data_times[n_star]
-
+    '''
     return t_new
 
 def sample_eta(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec, t_m_vec, f_vec,
