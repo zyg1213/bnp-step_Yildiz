@@ -385,7 +385,7 @@ def _softmax_sample_from_logits(logits, rng):
     cdf = np.cumsum(p)
     return int(np.searchsorted(cdf, u, side="left"))
 
-def sample_t_softmax_strict(weak_limit, num_data, data_points, data_times,
+def sample_t_softmax(weak_limit, num_data, data_points, data_times,
                             b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec, rng, temp,
                             Wacc=None, eps=1e-12):
     """
@@ -449,8 +449,11 @@ def sample_t_softmax_strict(weak_limit, num_data, data_points, data_times,
 
     tmin, tmax = float(data_times[0]), float(data_times[-1])
     
+    h_new = h.copy()
+    b_new = b.copy()
+    
     for m in order_scan:
-        hm = float(h[m])
+        hm = float(h_new[m])
 
         # Map latest tau to indices and build a stable order among active steps
         tau_idx_all = np.searchsorted(
@@ -464,7 +467,7 @@ def sample_t_softmax_strict(weak_limit, num_data, data_points, data_times,
         order = np.lexsort((on_idx, tau_idx_all))
         idx_ord = on_idx[order]
         tau_ord = tau_idx_all[order].astype(np.float64)
-        h_ord   = h[idx_ord].astype(np.float64)
+        h_ord   = h_new[idx_ord].astype(np.float64)
 
         #  Locate current step m and compute H1/H2 in real-time (O(B))
         pos = int(np.where(idx_ord == m)[0][0])
@@ -478,16 +481,17 @@ def sample_t_softmax_strict(weak_limit, num_data, data_points, data_times,
         # Sample index n* via softmax and write back the real time
         n_star = _softmax_sample_from_logits(logits, rng)
         t_new[m] = data_times[n_star]
-   
+        
+    '''
+        if np.isin(n_star, tau_ord):
+            over_pos = np.where(tau_ord == n_star)[0]
+            over_m = idx_ord[over_pos]
+                        
+        else:            
+            t_new[m] = data_times[n_star]
     '''
     
-
-        # Enforce non-decreasing and add tiny jitter if exact ties remain
-        tau_ord = np.maximum.accumulate(tau_ord)
-        if np.any(np.diff(tau_ord) <= 0):
-            tau_ord += eps * np.arange(tau_ord.size, dtype=np.float64)
-    '''
-    return t_new
+    return t_new, b_new, h_new
 
 def sample_eta(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec, t_m_vec, f_vec,
                phi, eta_ref, rng, temp):

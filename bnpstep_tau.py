@@ -6,6 +6,7 @@ Class for running BNP-Step and visualizing results.
 Alex Rojewski, 2023
 
 """
+import importlib
 import os
 from typing import Optional, Dict, Union, List
 from pathlib import Path
@@ -13,6 +14,7 @@ import warnings
 import numpy as np
 import bnpinputs as bnpi
 import bnpsampler as sampler
+importlib.reload(sampler)
 import bnpanalysis as bnpa
 import bic_tools as bic
 import pickle
@@ -393,8 +395,8 @@ class BNPStep:
                                                 self.T_M, self.F_S, self.ETA, self.rng, temperature)
                     '''
                     # Sample t with Softmax
-                    t_new = sampler.sample_t_softmax_strict(self.B_max, len(data["data"]), data["data"], t_n, self.B_M, self.H_M, 
-                                                self.T_M, self.F_S, self.ETA, self.rng, temperature, Wacc = self.Wacc)
+                    t_new, b_new, h_new = sampler.sample_t_softmax(self.B_max, len(data["data"]), data["data"], 
+                                t_n, self.B_M, self.H_M, self.T_M, self.F_S, self.ETA, self.rng, temperature, Wacc = self.Wacc)
                     
                     self.T_M = np.vstack((self.T_M, t_new))
                 elif (i == 3):
