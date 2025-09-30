@@ -471,13 +471,15 @@ def sample_t_softmax(weak_limit, num_data, data_points, data_times,
 
         #  Locate current step m and compute H1/H2 in real-time (O(B))
         pos = int(np.where(idx_ord == m)[0][0])
+        H1 = float(np.dot(h_ord[:pos], tau_ord[:pos])) if pos > 0 else 0.0
         H2 = float(np.sum(h_ord[pos+1:])) if pos + 1 < h_ord.size else 0.0
 
         # Build logits(n) = scale * [ a*Wacc[n] + b*n1 + c ]
         a = -2.0 * hm
         bcoef = 2.0 * F * hm + hm * hm + 2.0 * hm * H2
-        logits = scale * (a * Wacc + bcoef * n1)  # length N
-
+        c = 2.0 * hm * H1
+        logits = scale * (a * Wacc + bcoef * n1 + c)
+        logits -= logits.max()
         # Sample index n* via softmax and write back the real time
         n_star = _softmax_sample_from_logits(logits, rng)
         t_new[m] = data_times[n_star]
@@ -491,7 +493,107 @@ def sample_t_softmax(weak_limit, num_data, data_points, data_times,
             t_new[m] = data_times[n_star]
     '''
     
-    return t_new, b_new, h_new
+    return t_new
+    
+def sample_t_softmax_strict(weak_limit, num_data, data_points, data_times,
+                            b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec, rng, temp,
+                            Wacc=None, eps=1e-12):
+    """
+    Softmax Gibbs for tau with per-candidate H1/H2 (correct cross term):
+      S_m(n) ∝ -η/2 [ -2h_m Wacc[n] + (2Fh_m + h_m^2) n + 2h_m (H1(n) + n H2(n)) ].
+    H1/H2 depend on n via p(n)=# {k!=m: tau_k <= n}.
+    """
+    b   = np.asarray(b_m_vec[-1], dtype=np.int8)
+    h   = np.asarray(h_m_vec[-1], dtype=np.float64)
+    t   = np.asarray(t_m_vec[-1], dtype=np.float64)
+    F   = float(f_vec[-1])
+    eta = float(eta_vec[-1])
+    N   = int(num_data)
+    M   = int(weak_limit)
+
+    # 前缀和与索引 1..N
+    if Wacc is None:
+        Wacc = np.cumsum(np.asarray(data_points, dtype=np.float64))
+    else:
+        Wacc = np.asarray(Wacc, dtype=np.float64)
+    n1 = np.arange(1, N+1, dtype=np.float64)
+
+    on_mask = (b == 1)
+    on_idx  = np.where(on_mask)[0]
+    off_idx = np.where(~on_mask)[0]
+
+    t_new = t.copy()
+
+    # （建议）inactive 的 tau 不必每轮乱抽，保持旧值即可；如要兼容老行为可保留下一段
+    # for m in off_idx:
+    #     t_new[m] = rng.choice(data_times)
+
+    if on_idx.size == 0:
+        return t_new
+
+    scale = -eta / (2.0 * max(float(temp), eps))
+
+    order_scan = np.array(on_idx, copy=True)
+    rng.shuffle(order_scan)
+
+    # 预备：候选 n 的数组，用于一次性向量化
+    # （接下来每个 m 会针对“其他步”构造各自的 P1/P2，然后在这同一个 n1 上评估）
+    for m in order_scan:
+        hm = float(h[m])
+
+        # —— 其他激活步（排除 m） —— #
+        others = on_idx[on_idx != m]
+        if others.size == 0:
+            # 没有交叉项，直接用两项
+            logits = scale * (-2.0*hm*Wacc + (2.0*F*hm + hm*hm)*n1)
+            # 稳定 softmax 采样
+            z = logits - logits.max()
+            p = np.exp(z, dtype=np.float64); p /= p.sum()
+            u = rng.random(); cdf = np.cumsum(p)
+            n_star = int(np.searchsorted(cdf, u, side="left"))
+            t_new[m] = data_times[n_star]
+            continue
+
+        # 其他步的 tau 索引（0..N-1）与计数（1..N），按 tau 升序
+        tau_idx_other = np.searchsorted(data_times, t_new[others], side="left")
+        tau_idx_other = np.clip(tau_idx_other, 0, N-1)
+        order = np.argsort(tau_idx_other, kind="stable")
+        tau_other_sorted = tau_idx_other[order].astype(np.int64)     # 0..N-1
+        h_other_sorted   = h[others][order].astype(np.float64)
+        tau_cnt_other    = tau_other_sorted.astype(np.float64) + 1.0 # 1..N
+        L = tau_other_sorted.size
+
+        # 组前缀/后缀（含“空前缀”的 0，便于按段索引）
+        P1 = np.zeros(L+1, dtype=np.float64)              # P1[j] = Σ_{k≤j} h_k τ_k
+        P1[1:] = np.cumsum(h_other_sorted * tau_cnt_other)
+        Suf = np.zeros(L+1, dtype=np.float64)             # Suf[j] = Σ_{k>j} h_k
+        # 后缀：从右往左累加，再往前对齐
+        Suf[:-1] = np.cumsum(h_other_sorted[::-1])[::-1]
+
+        # 对所有候选 n=1..N，一次性找到 p(n) = # {τ_k ≤ n}
+        # 注意 tau_other_sorted 用的是 0..N-1，对应 n 的 1..N，要用 side='right'
+        p = np.searchsorted(tau_cnt_other, n1, side='right')  # 0..L
+
+        H1_vec = P1[p]                 # shape (N,)
+        H2_vec = Suf[p]                # shape (N,)
+
+        # 完整 logits（包含随 n 变动的交叉项）
+        logits = scale * (-2.0*hm*Wacc + (2.0*F*hm + hm*hm)*n1 + 2.0*hm*(H1_vec + n1*H2_vec))
+
+        # 稳定 softmax 采样
+        z = logits - logits.max()
+        p = np.exp(z, dtype=np.float64); s = p.sum()
+        if not np.isfinite(s) or s <= 0.0:
+            n_star = int(np.argmax(logits))
+        else:
+            p /= s
+            u = rng.random(); cdf = np.cumsum(p)
+            n_star = int(np.searchsorted(cdf, u, side="left"))
+
+        t_new[m] = data_times[n_star]
+
+    return t_new
+
 
 def sample_eta(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec, t_m_vec, f_vec,
                phi, eta_ref, rng, temp):
