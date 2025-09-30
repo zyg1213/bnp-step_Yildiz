@@ -525,8 +525,8 @@ def sample_t_softmax_strict(weak_limit, num_data, data_points, data_times,
     t_new = t.copy()
 
     # （建议）inactive 的 tau 不必每轮乱抽，保持旧值即可；如要兼容老行为可保留下一段
-    # for m in off_idx:
-    #     t_new[m] = rng.choice(data_times)
+    for m in off_idx:
+        t_new[m] = rng.choice(data_times)
 
     if on_idx.size == 0:
         return t_new
