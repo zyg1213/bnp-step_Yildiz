@@ -388,12 +388,12 @@ def _softmax_sample_from_logits(logits, rng):
 def sample_t_softmax(weak_limit, num_data, data_points, data_times,
                             b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec, rng, temp,
                             Wacc=None, eps=1e-12):
-    """
-    Strict softmax Gibbs update for all tau_m (sampling efficiency prioritized).
-      - Only compute softmax for active steps (b_m=1); inactive steps sample from prior
-      - After each tau_m update, recompute H1/H2 using the latest tau_{-m} (strict Gibbs)
-      - Numerically stable: log-sum-exp, clipping, tie-handling, temperature scaling
 
+    """
+    Softmax Gibbs for tau with per-candidate H1/H2 (correct cross term):
+      S_m(n) ∝ -η/2 [ -2h_m Wacc[n] + (2Fh_m + h_m^2) n + 2h_m (H1(n) + n H2(n)) ].
+    H1/H2 depend on n via p(n)=# {k!=m: tau_k <= n}.
+    
     Args:
       weak_limit: M (max number of steps)
       num_data: N (number of observations)
@@ -407,101 +407,6 @@ def sample_t_softmax(weak_limit, num_data, data_points, data_times,
 
     Returns:
       t_new: array (length M) with updated real-valued tau times
-    """
-    # -- Current state (use last samples) --
-    b   = np.asarray(b_m_vec[-1], dtype=np.int8)        # (M,)
-    h   = np.asarray(h_m_vec[-1], dtype=np.float64)     # (M,)
-    t   = np.asarray(t_m_vec[-1], dtype=np.float64)     # (M,) real times
-    F   = float(f_vec[-1])
-    eta = float(eta_vec[-1])
-    M   = int(weak_limit)
-    N   = int(num_data)
-
-    # -- Precompute Wacc and index vector 1..N --
-    if Wacc is None:
-        Wacc = np.cumsum(np.asarray(data_points, dtype=np.float64))
-    else:
-        Wacc = np.asarray(Wacc, dtype=np.float64)
-    n1 = np.arange(1, N + 1, dtype=np.float64)
-
-    # -- Partition active and inactive steps --
-    on_mask = (b == 1)
-    on_idx  = np.where(on_mask)[0]
-    off_idx = np.where(~on_mask)[0]
-
-    # Initialize result with old values
-    t_new = t.copy()
-
-    # Inactive steps: sample from prior (uniform over data_times) to match original behavior
-    for m in off_idx:
-        t_new[m] = rng.choice(data_times)
-
-    # If no active steps, we are done
-    if on_idx.size == 0:
-        return t_new
-
-    # -- Temperature scaling in energy --
-    scale = -eta / (2.0 * max(float(temp), eps))
-
-    # -- Random-scan Gibbs (better mixing) --
-    order_scan = np.array(on_idx, copy=True)
-    rng.shuffle(order_scan)
-
-    tmin, tmax = float(data_times[0]), float(data_times[-1])
-    
-    h_new = h.copy()
-    b_new = b.copy()
-    
-    for m in order_scan:
-        hm = float(h_new[m])
-
-        # Map latest tau to indices and build a stable order among active steps
-        tau_idx_all = np.searchsorted(
-            data_times,
-            np.clip(t_new[on_idx], tmin, tmax),
-            side="left"
-        )
-        tau_idx_all = np.clip(tau_idx_all, 0, N - 1)
-    
-        # Stable sort by (tau_idx, original index)
-        order = np.lexsort((on_idx, tau_idx_all))
-        idx_ord = on_idx[order]
-        tau_ord = tau_idx_all[order].astype(np.float64)
-        h_ord   = h_new[idx_ord].astype(np.float64)
-
-        #  Locate current step m and compute H1/H2 in real-time (O(B))
-        pos = int(np.where(idx_ord == m)[0][0])
-        H1 = float(np.dot(h_ord[:pos], tau_ord[:pos])) if pos > 0 else 0.0
-        H2 = float(np.sum(h_ord[pos+1:])) if pos + 1 < h_ord.size else 0.0
-
-        # Build logits(n) = scale * [ a*Wacc[n] + b*n1 + c ]
-        a = -2.0 * hm
-        bcoef = 2.0 * F * hm + hm * hm + 2.0 * hm * H2
-        c = 2.0 * hm * H1
-        logits = scale * (a * Wacc + bcoef * n1 + c)
-        logits -= logits.max()
-        # Sample index n* via softmax and write back the real time
-        n_star = _softmax_sample_from_logits(logits, rng)
-        t_new[m] = data_times[n_star]
-        
-    '''
-        if np.isin(n_star, tau_ord):
-            over_pos = np.where(tau_ord == n_star)[0]
-            over_m = idx_ord[over_pos]
-                        
-        else:            
-            t_new[m] = data_times[n_star]
-    '''
-    
-    return t_new
-    
-def sample_t_softmax_strict(weak_limit, num_data, data_points, data_times,
-                            b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec, rng, temp,
-                            Wacc=None, eps=1e-12):
-    """
-    Softmax Gibbs for tau with per-candidate H1/H2 (correct cross term):
-      S_m(n) ∝ -η/2 [ -2h_m Wacc[n] + (2Fh_m + h_m^2) n + 2h_m (H1(n) + n H2(n)) ].
-    H1/H2 depend on n via p(n)=# {k!=m: tau_k <= n}.
     """
     b   = np.asarray(b_m_vec[-1], dtype=np.int8)
     h   = np.asarray(h_m_vec[-1], dtype=np.float64)
