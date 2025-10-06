@@ -11,6 +11,123 @@ from scipy import special
 from distributions import MultivariateGaussian
 
 
+def sample_bt_softmax(weak_limit, num_data, data_points, data_times,
+                            b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec, gamma, rng, temp,
+                            Wacc=None, eps=1e-12):
+
+    """
+    Softmax Gibbs for tau with per-candidate H1/H2 (correct cross term):
+      S_m(n) ∝ -η/2 [ -2h_m Wacc[n] + (2Fh_m + h_m^2) n + 2h_m (H1(n) + n H2(n)) ].
+    H1/H2 depend on n via p(n)=# {k!=m: tau_k <= n}.
+    
+    Args:
+      weak_limit: M (max number of steps)
+      num_data: N (number of observations)
+      data_points: array of length N (w_1..N)
+      data_times: array of length N (assumed non-decreasing)
+      b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec: sampler histories (use last entries)
+      rng: numpy.random.Generator
+      temp: temperature for simulated annealing (>=1 typically)
+      Wacc: optional prefix sums of data_points; if None, computed via cumsum
+      eps: small epsilon for numerical guards
+
+    Returns:
+      t_new: array (length M) with updated real-valued tau times
+    """
+    b   = np.asarray(b_m_vec[-1], dtype=np.int8)
+    h   = np.asarray(h_m_vec[-1], dtype=np.float64)
+    t   = np.asarray(t_m_vec[-1], dtype=np.float64)
+    F   = float(f_vec[-1])
+    eta = float(eta_vec[-1])
+    N   = int(num_data)
+    M   = int(weak_limit)
+
+    # 前缀和与索引 1..N
+    if Wacc is None:
+        Wacc = np.cumsum(np.asarray(data_points, dtype=np.float64))
+    else:
+        Wacc = np.asarray(Wacc, dtype=np.float64)
+    n1 = np.arange(1, N+1, dtype=np.float64)
+
+    t_new = t.copy()
+    b_new = b.copy()
+
+    scale = -eta / (2.0 * max(float(temp), eps))
+
+    order_scan = rng.permutation(M)
+
+    # 预备：候选 n 的数组，用于一次性向量化
+    # （接下来每个 m 会针对“其他步”构造各自的 P1/P2，然后在这同一个 n1 上评估）
+    for m in order_scan:
+        on_mask = (b_new == 1)
+        on_idx  = np.where(on_mask)[0]
+        hm = float(h[m])
+
+        # —— 其他激活步（排除 m） —— #
+        others = on_idx[on_idx != m]
+        if others.size == 0:
+            # 没有交叉项，直接用两项
+            logits = scale * (-2.0*hm*Wacc + (2.0*F*hm + hm*hm)*n1)
+        else:
+            
+            # 其他步的 tau 索引（0..N-1）与计数（1..N），按 tau 升序
+            tau_idx_other = np.searchsorted(data_times, t_new[others], side="left")
+            tau_idx_other = np.clip(tau_idx_other, 0, N-1)
+            order = np.argsort(tau_idx_other, kind="stable")
+            tau_other_sorted = tau_idx_other[order].astype(np.int64)     # 0..N-1
+            h_other_sorted   = h[others][order].astype(np.float64)
+            tau_cnt_other    = tau_other_sorted.astype(np.float64) + 1.0 # 1..N
+            L = tau_other_sorted.size
+    
+            # 组前缀/后缀（含“空前缀”的 0，便于按段索引）
+            P1 = np.zeros(L+1, dtype=np.float64)              # P1[j] = Σ_{k≤j} h_k τ_k
+            P1[1:] = np.cumsum(h_other_sorted * tau_cnt_other)
+            Suf = np.zeros(L+1, dtype=np.float64)             # Suf[j] = Σ_{k>j} h_k
+            # 后缀：从右往左累加，再往前对齐
+            Suf[:-1] = np.cumsum(h_other_sorted[::-1])[::-1]
+    
+            # 对所有候选 n=1..N，一次性找到 p(n) = # {τ_k ≤ n}
+            # 注意 tau_other_sorted 用的是 0..N-1，对应 n 的 1..N，要用 side='right'
+            p = np.searchsorted(tau_cnt_other, n1, side='right')  # 0..L
+    
+            H1_vec = P1[p]                 # shape (N,)
+            H2_vec = Suf[p]                # shape (N,)
+    
+            # 完整 logits（包含随 n 变动的交叉项）
+            logits = scale * (-2.0*hm*Wacc + (2.0*F*hm + hm*hm)*n1 + 2.0*hm*(H1_vec + n1*H2_vec))
+    
+            # 稳定 softmax 采样
+
+        logits_max = logits.max()
+        z = logits - logits.max()
+        p = np.exp(z, dtype=np.float64); s = p.sum()
+
+        # If the logits has weired value, we will use hard max fot tau and bm will keep unchanged
+        if not np.isfinite(s) or s <= 0.0:
+            n_star = int(np.argmax(logits))
+            t_new[m] = data_times[n_star]
+            b_new[m] = b_new[m]
+        else:
+            # compare the sum posterior of bm = 1 with bm = 0
+            lm = logits.max()
+            logsum = lm + np.log(np.sum(np.exp(logits - lm)))
+            log_p_on  = logsum - np.log(N) + np.log(gamma) - np.log(M)
+            log_p_off = np.log(max(1.0 - gamma/ M, eps))
+            p_b1 = 1.0 / (1.0 + np.exp(log_p_off - log_p_on))   # sigmoid
+
+            if rng.random() < p_b1:
+                b_new[m] = 1
+                
+                p /= s
+                u = rng.random(); cdf = np.cumsum(p)
+                n_star = int(np.searchsorted(cdf, u, side="left"))
+                t_new[m] = data_times[n_star]
+            else:
+                b_new[m] = 0  
+                # t_new[m] = rng.choice(data_times)
+    return b_new, t_new
+
+
 def sample_b(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec, gamma, rng,
              temp):
     """
@@ -366,24 +483,7 @@ def sample_t(weak_limit, num_data, data_points, data_times, b_m_vec, h_m_vec,
                 times_matrix[:, sampling_order[i]] = t_old
 
     return times_matrix[0]
-
-def _softmax_sample_from_logits(logits, rng):
-    """
-    Numerically stable softmax sampling:
-    - logits: 1D array of real-valued scores
-    - returns: one index sampled according to softmax(logits)
-    """
-    z = logits - np.max(logits)                  # log-sum-exp stabilization
-    p = np.exp(z, dtype=np.float64)
-    s = p.sum()
-    if not np.isfinite(s) or s <= 0.0:           # extreme underflow/NaN guard
-        # fall back to argmax, which matches the limit of an extremely peaked softmax
-        return int(np.argmax(logits))
-    p /= s
-    # sample via inverse-CDF to be robust when p is very sparse
-    u = rng.random()
-    cdf = np.cumsum(p)
-    return int(np.searchsorted(cdf, u, side="left"))
+    
 
 def sample_t_softmax(weak_limit, num_data, data_points, data_times,
                             b_m_vec, h_m_vec, t_m_vec, f_vec, eta_vec, rng, temp,
@@ -429,7 +529,6 @@ def sample_t_softmax(weak_limit, num_data, data_points, data_times,
 
     t_new = t.copy()
 
-    # （建议）inactive 的 tau 不必每轮乱抽，保持旧值即可；如要兼容老行为可保留下一段
     for m in off_idx:
         t_new[m] = rng.choice(data_times)
 

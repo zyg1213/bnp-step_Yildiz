@@ -385,20 +385,12 @@ class BNPStep:
                     self.H_M = np.vstack((self.H_M, h_new))
                 elif (i == 1):
                     # Sample b_m
-                    b_new = sampler.sample_b(self.B_max, len(data["data"]), data["data"], t_n, self.B_M, self.H_M, 
-                                                self.T_M, self.F_S, self.ETA, self.gamma, self.rng, temperature)
-                    self.B_M = np.vstack((self.B_M, b_new))
-                elif (i == 2):
-                    # Sample t_m 
-                    '''
-                    t_new = sampler.sample_t(self.B_max, len(data["data"]), data["data"], t_n, self.B_M, self.H_M, 
-                                                self.T_M, self.F_S, self.ETA, self.rng, temperature)
-                    '''
-                    # Sample t with Softmax
-                    t_new = sampler.sample_t_softmax_strict(self.B_max, len(data["data"]), data["data"], 
-                                t_n, self.B_M, self.H_M, self.T_M, self.F_S, self.ETA, self.rng, temperature, Wacc = self.Wacc)
+                    b_new, t_new = sampler.sample_bt_softmax(self.B_max, len(data["data"]), data["data"], 
+                                t_n, self.B_M, self.H_M, self.T_M, self.F_S, self.ETA, self.gamma, self.rng, temperature, 
+                                                             Wacc = self.Wacc)
                     
                     self.T_M = np.vstack((self.T_M, t_new))
+                    self.B_M = np.vstack((self.B_M, b_new))
                 elif (i == 3):
                     # Sample eta
                     new_eta = sampler.sample_eta(self.B_max, len(data["data"]), data["data"], t_n, self.B_M, self.H_M, 
