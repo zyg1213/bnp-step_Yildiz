@@ -120,6 +120,10 @@ def load_data_csv(filename: str,
         data_np = pd.DataFrame.to_numpy(data_fr)
         times = data_np[:, 0]
         data = data_np[:, 1]
+        if np.shape(data_np)[1] > 2:
+            ground = {"x": data_np[:, 0], "u": data_np[:, 2]}
+        else:
+            ground = None
         
         # Build dictionary for output
         dataset["data"] = data
@@ -134,7 +138,8 @@ def load_data_csv(filename: str,
         dataset["data"] = data
         dataset["times"] = None
     
-    dataset["ground_truths"] = None
+#     dataset["ground_truths"] = None
+    dataset["ground_truths"] = ground
     dataset["parameters"] = None
 
     return dataset
